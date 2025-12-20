@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name         Ficbook Downloader — EPUB & FB2
 // @namespace    https://github.com/kaihotabito/figbook-downloader/
-// @version      2.2
+// @version      2.3
 // @description  Скачивание фанфиков с Ficbook в EPUB и FB2
 // @author       kaihotabito
 // @match        https://ficbook.net/readfic/*
 // @grant        unsafeWindow
+// @grant        GM_xmlhttpRequest
+// @connect      assets.teinon.net
 // @run-at       document-idle
 // @license MIT
 // ==/UserScript==
@@ -279,6 +281,122 @@
       .replace(/\s+/g, ' ')
       .trim()
       .slice(0, 180) || 'ficbook';
+  }
+
+  function normalizeCoverUrl(rawUrl) {
+    const s = String(rawUrl ?? '').trim();
+    if (!s) return '';
+    try {
+      const u = new URL(s, location.href);
+      // На CDN teinon.net у обложек бывают префиксы размеров (m_/s_/d_). Предпочитаем d_.
+      u.pathname = u.pathname.replace(/\/fanfic-covers\/[ms]_/i, '/fanfic-covers/d_');
+      return u.toString();
+    } catch (_) {
+      return s;
+    }
+  }
+
+  function getCoverUrlFromDoc(doc = document) {
+    const raw =
+      doc.querySelector('meta[property="og:image"]')?.getAttribute('content') ||
+      doc.querySelector('meta[name="twitter:image"]')?.getAttribute('content') ||
+      doc.querySelector('meta[name="twitter:image:src"]')?.getAttribute('content') ||
+      '';
+
+    return normalizeCoverUrl(raw) || '';
+  }
+
+  function guessImageMediaTypeFromUrl(url) {
+    const s = String(url ?? '').toLowerCase();
+    if (s.includes('.png')) return { mediaType: 'image/png', ext: 'png' };
+    if (s.includes('.jpg') || s.includes('.jpeg')) return { mediaType: 'image/jpeg', ext: 'jpg' };
+    if (s.includes('.gif')) return { mediaType: 'image/gif', ext: 'gif' };
+    if (s.includes('.webp')) return { mediaType: 'image/webp', ext: 'webp' };
+    return { mediaType: '', ext: '' };
+  }
+
+  async function fetchBinaryBytes(url, { timeoutMs = 20000 } = {}) {
+    const u = String(url ?? '').trim();
+    if (!u) return null;
+
+    // Userscript-уровень (Tampermonkey/Violentmonkey): позволяет обойти CORS для CDN.
+    const gmXhr = (typeof GM_xmlhttpRequest === 'function')
+      ? GM_xmlhttpRequest
+      : (typeof GM !== 'undefined' && GM && typeof GM.xmlHttpRequest === 'function')
+        ? ((opts) => GM.xmlHttpRequest(opts))
+        : null;
+
+    if (gmXhr) {
+      const res = await new Promise((resolve) => {
+        let done = false;
+        const finish = (v) => { if (done) return; done = true; resolve(v); };
+        const t = setTimeout(() => finish(null), timeoutMs);
+
+        try {
+          gmXhr({
+            method: 'GET',
+            url: u,
+            responseType: 'arraybuffer',
+            onload: (r) => {
+              clearTimeout(t);
+              const status = Number(r?.status || 0);
+              if (!(status >= 200 && status < 300)) return finish(null);
+
+              const buf = r?.response;
+              const bytes = buf ? new Uint8Array(buf) : null;
+              if (!bytes || !bytes.length) return finish(null);
+
+              // responseHeaders: "Header: value\r\n..."
+              const hdrs = String(r?.responseHeaders || '');
+              const m = hdrs.match(/^\s*content-type\s*:\s*([^\r\n;]+)\s*/im);
+              const ct = (m?.[1] || '').trim().toLowerCase();
+              finish({ bytes, contentType: ct });
+            },
+            onerror: () => { clearTimeout(t); finish(null); },
+            ontimeout: () => { clearTimeout(t); finish(null); },
+          });
+        } catch (_) {
+          clearTimeout(t);
+          finish(null);
+        }
+      });
+
+      if (res) return res;
+    }
+
+    let ctrl = null;
+    let timer = null;
+    try {
+      if (typeof AbortController !== 'undefined') ctrl = new AbortController();
+      if (ctrl) timer = setTimeout(() => { try { ctrl.abort(); } catch (_) {} }, timeoutMs);
+
+      const resp = await fetch(u, {
+        // Картинки часто лежат на отдельном домене CDN
+        mode: 'cors',
+        credentials: 'omit',
+        signal: ctrl?.signal
+      });
+      if (!resp.ok) return null;
+
+      const buf = await resp.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      const ct = (resp.headers?.get?.('content-type') || '').split(';')[0].trim().toLowerCase();
+      return { bytes, contentType: ct };
+    } catch (_) {
+      return null;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  function bytesToBase64(bytes) {
+    if (!bytes || !bytes.length) return '';
+    let bin = '';
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+    }
+    return btoa(bin);
   }
 
   function normalizeText(t) {
@@ -594,6 +712,7 @@
       descriptionNodes: null,
       authorNoteNodes: null,
       dedicationNodes: null,
+      coverUrl: getCoverUrlFromDoc(doc),
       url: getBaseFicUrl(),
     };
 
@@ -649,6 +768,82 @@
     return meta;
   }
 
+  function pickPartCommentContentNode(container) {
+    if (!container) return null;
+    return (
+      container.querySelector('.urlized-links') ||
+      container.querySelector('.js-public-beta-comment-before') ||
+      container.querySelector('.js-public-beta-comment-after') ||
+      container.querySelector('.text-preline') ||
+      null
+    );
+  }
+
+  function stripLeadingPartNoteHeaderInPlace(container) {
+    if (!container) return container;
+    const isHeaderText = (txt) => {
+      const s = normalizeText(txt).replace(/\s+/g, ' ').trim().replace(/[:：]+$/, '').toLowerCase();
+      return s === 'примечание' || s === 'примечания' || s === 'примечание к части' || s === 'примечания к части';
+    };
+
+    const firstMeaningfulChild = () => {
+      const nodes = Array.from(container.childNodes || []);
+      for (const n of nodes) {
+        if (n.nodeType === Node.TEXT_NODE) {
+          if (String(n.nodeValue || '').trim().length) return n;
+          continue;
+        }
+        if (n.nodeType !== Node.ELEMENT_NODE) continue;
+        const t = (n.textContent || '').trim();
+        if (t.length) return n;
+      }
+      return null;
+    };
+
+    // Удаляем несколько подряд "Примечания:" / "Примечание:" в начале блока.
+    for (let k = 0; k < 4; k++) {
+      const first = firstMeaningfulChild();
+      if (!first) break;
+
+      if (first.nodeType === Node.TEXT_NODE) {
+        if (isHeaderText(first.nodeValue || '')) {
+          first.remove();
+          continue;
+        }
+        break;
+      }
+
+      // Элемент целиком является заголовком
+      const txt = first.textContent || '';
+      if (isHeaderText(txt)) {
+        first.remove();
+        continue;
+      }
+
+      // Заголовок как префикс внутри первого блока (например: "<p><strong>Примечания:</strong> Текст...</p>")
+      if (first.nodeType === Node.ELEMENT_NODE && first.firstChild) {
+        const strong = (first.firstElementChild && ['STRONG', 'B'].includes(first.firstElementChild.tagName?.toUpperCase?.()))
+          ? first.firstElementChild
+          : null;
+        const strongTxt = strong ? (strong.textContent || '') : '';
+        if (strong && isHeaderText(strongTxt)) {
+          strong.remove();
+          // убрать ведущие ":"/пробелы в следующем текстовом узле
+          const n0 = first.firstChild;
+          if (n0 && n0.nodeType === Node.TEXT_NODE) {
+            n0.nodeValue = String(n0.nodeValue || '').replace(/^\s*[:：]\s*/, '');
+          }
+          if (!(first.textContent || '').trim()) first.remove();
+          continue;
+        }
+      }
+
+      break;
+    }
+
+    return container;
+  }
+
   async function fetchTocDoc() {
     if (isTocPage(document)) return document;
 
@@ -692,7 +887,7 @@
       if (!current) continue;
 
       if (node.classList.contains('part-comment-top')) {
-        current.noteTopNode = node.querySelector('.urlized-links') || node;
+        current.noteTopNode = pickPartCommentContentNode(node) || stripLeadingPartNoteHeaderInPlace(node.cloneNode(true));
         continue;
       }
       if (node.classList.contains('part_text')) {
@@ -700,7 +895,7 @@
         continue;
       }
       if (node.classList.contains('part-comment-bottom')) {
-        current.noteBottomNode = node.querySelector('.urlized-links') || node;
+        current.noteBottomNode = pickPartCommentContentNode(node) || stripLeadingPartNoteHeaderInPlace(node.cloneNode(true));
         continue;
       }
     }
@@ -1096,14 +1291,53 @@
       Источник: <a href="${safeUrl}">${safeUrl}</a>
     </div>
   </div>
-</body>
+    </body>
     </html>`;
     zipEntries.push({ name: 'OEBPS/title.xhtml', data: titleXhtml });
+
+    // Обложка (если доступна)
+    let cover = null;
+    if (data.coverUrl) {
+      const guessed = guessImageMediaTypeFromUrl(data.coverUrl);
+      const fetched = await fetchBinaryBytes(data.coverUrl);
+      const bytes = fetched?.bytes;
+      if (bytes && bytes.length) {
+        const ct = fetched?.contentType || guessed.mediaType || '';
+        const mediaType = (ct.startsWith('image/') ? ct : (guessed.mediaType || 'image/png'));
+        const ext = guessed.ext || (mediaType === 'image/jpeg' ? 'jpg' : (mediaType.split('/')[1] || 'png'));
+
+        const imgHref = `cover.${ext}`;
+        zipEntries.push({ name: `OEBPS/${imgHref}`, data: bytes });
+
+        const coverXhtml = `<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN"
+  "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <title>Обложка</title>
+  <link rel="stylesheet" href="style.css" type="text/css"/>
+</head>
+<body style="margin:0; padding:0; text-align:center;">
+  <div style="margin: 0 auto; padding: 0;">
+    <img src="${escapeXml(imgHref)}" alt="cover" style="max-width: 100%; height: auto;"/>
+  </div>
+</body>
+</html>`;
+
+        zipEntries.push({ name: 'OEBPS/cover.xhtml', data: coverXhtml });
+        cover = { imgHref, mediaType };
+      }
+    }
 
     const items = [];
     const spine = [];
     items.push(`<item id="css" href="style.css" media-type="text/css"/>`);
     items.push(`<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>`);
+    if (cover) {
+      items.push(`<item id="coverimg" href="${escapeXml(cover.imgHref)}" media-type="${escapeXml(cover.mediaType)}"/>`);
+      items.push(`<item id="coverpage" href="cover.xhtml" media-type="application/xhtml+xml"/>`);
+      spine.push(`<itemref idref="coverpage"/>`);
+    }
     items.push(`<item id="title" href="title.xhtml" media-type="application/xhtml+xml"/>`);
     spine.push(`<itemref idref="title"/>`);
 
@@ -1151,10 +1385,10 @@
 
       const contentHtml = chap.contentNode ? xhtmlBlocksFromNode(chap.contentNode, false) : '';
       const topHtml = chap.noteTopNode
-        ? `<div class="author-note"><strong>Примечание:</strong>${xhtmlBlocksFromNode(chap.noteTopNode, true)}</div>`
+        ? `<div class="author-note"><strong>Примечание к части:</strong>${xhtmlBlocksFromNode(chap.noteTopNode, true)}</div>`
         : '';
       const botHtml = chap.noteBottomNode
-        ? `<div class="author-note"><strong>Примечание:</strong>${xhtmlBlocksFromNode(chap.noteBottomNode, true)}</div>`
+        ? `<div class="author-note"><strong>Примечание к части:</strong>${xhtmlBlocksFromNode(chap.noteBottomNode, true)}</div>`
         : '';
 
       if (DEBUG) {
@@ -1189,6 +1423,8 @@
     }
 
     const plainDesc = data.descriptionNodes ? normalizeText(data.descriptionNodes.textContent || '').trim() : '';
+    const coverMeta = cover ? `\n    <meta name="cover" content="coverimg"/>` : '';
+    const coverGuide = cover ? `\n    <reference type="cover" title="Обложка" href="cover.xhtml"/>` : '';
 
     const opf = `<?xml version="1.0" encoding="UTF-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" unique-identifier="BookId" version="2.0">
@@ -1198,7 +1434,7 @@
     <dc:creator>${escapeXml(data.author)}</dc:creator>
     <dc:language>ru</dc:language>
     <dc:date>${escapeXml(isoDate)}</dc:date>
-    <dc:description>${escapeXml(plainDesc)}</dc:description>
+    <dc:description>${escapeXml(plainDesc)}</dc:description>${coverMeta}
   </metadata>
   <manifest>
     ${items.join('\n    ')}
@@ -1208,6 +1444,7 @@
   </spine>
   <guide>
     <reference type="toc" title="Содержание" href="toc.xhtml"/>
+    ${coverGuide}
   </guide>
 </package>`;
     zipEntries.push({ name: 'OEBPS/content.opf', data: opf });
@@ -1256,6 +1493,25 @@
     const bookId = uuidUrn();
     const isoDate = new Date().toISOString().slice(0, 10);
 
+    // Обложка (если доступна)
+    let coverpage = '';
+    let binaryCover = '';
+    if (data.coverUrl) {
+      const guessed = guessImageMediaTypeFromUrl(data.coverUrl);
+      const fetched = await fetchBinaryBytes(data.coverUrl);
+      const bytes = fetched?.bytes;
+      const ct = (fetched?.contentType || guessed.mediaType || '').toLowerCase();
+
+      // В большинстве FB2-ридеров гарантированно работают PNG/JPEG/GIF.
+      if (bytes && bytes.length && ['image/png', 'image/jpeg', 'image/gif'].includes(ct)) {
+        const b64 = bytesToBase64(bytes);
+        if (b64) {
+          coverpage = `\n      <coverpage><image l:href=\"#cover\"/></coverpage>`;
+          binaryCover = `\n  <binary id=\"cover\" content-type=\"${escapeXml(ct)}\">${b64}</binary>`;
+        }
+      }
+    }
+
     let annotation = '';
 
     if (data.descriptionNodes) {
@@ -1303,7 +1559,7 @@
 
       if (chap.noteTopNode) {
         const top = fb2BlocksFromNode(chap.noteTopNode, true).trim();
-        if (top) body += `<subtitle>Примечание</subtitle>\n${top}\n<empty-line/>\n`;
+        if (top) body += `<subtitle>Примечание к части</subtitle>\n${top}\n<empty-line/>\n`;
       }
 
       if (chap.contentNode) {
@@ -1313,7 +1569,7 @@
 
       if (chap.noteBottomNode) {
         const bot = fb2BlocksFromNode(chap.noteBottomNode, true).trim();
-        if (bot) body += `<empty-line/>\n<subtitle>Примечание</subtitle>\n${bot}\n`;
+        if (bot) body += `<empty-line/>\n<subtitle>Примечание к части</subtitle>\n${bot}\n`;
       }
 
       body += `</section>\n`;
@@ -1321,17 +1577,17 @@
 
     const fb2 = `<?xml version="1.0" encoding="UTF-8"?>
 <FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0"
-             xmlns:l="http://www.w3.org/1999/xlink">
-  <description>
-    <title-info>
-      ${fb2Genres.map(g => `<genre>${escapeXml(g)}</genre>`).join('\n      ')}
-      <author><nickname>${escapeXml(data.author)}</nickname></author>
-      <book-title>${escapeXml(data.title)}</book-title>
-      ${keywordsUniq.length ? `<keywords>${escapeXml(keywordsUniq.join(', '))}</keywords>` : ''}
-      <annotation>
+	             xmlns:l="http://www.w3.org/1999/xlink">
+	  <description>
+	    <title-info>
+	      ${fb2Genres.map(g => `<genre>${escapeXml(g)}</genre>`).join('\n      ')}
+	      <author><nickname>${escapeXml(data.author)}</nickname></author>
+	      <book-title>${escapeXml(data.title)}</book-title>${coverpage}
+	      ${keywordsUniq.length ? `<keywords>${escapeXml(keywordsUniq.join(', '))}</keywords>` : ''}
+	      <annotation>
 ${annotation.trim()}
-      </annotation>
-      <lang>ru</lang>
+	      </annotation>
+	      <lang>ru</lang>
       <date value="${escapeXml(isoDate)}">${escapeXml(isoDate)}</date>
     </title-info>
     <document-info>
@@ -1341,11 +1597,12 @@ ${annotation.trim()}
       <id>${escapeXml(bookId)}</id>
       <version>3.1</version>
     </document-info>
-  </description>
-  <body>
+	  </description>
+	  <body>
 ${body.trim()}
-  </body>
-</FictionBook>`;
+	  </body>
+	${binaryCover}
+	</FictionBook>`;
 
     return new Blob([fb2], { type: 'text/xml;charset=utf-8' });
   }
@@ -1367,8 +1624,11 @@ ${body.trim()}
       (doc.querySelector('h2')?.textContent || '').trim() ||
       `Глава ${partId}`;
 
-    const noteTopNode = doc.querySelector('.part-comment-top .urlized-links') || doc.querySelector('.part-comment-top') || null;
-    const noteBotNode = doc.querySelector('.part-comment-bottom .urlized-links') || doc.querySelector('.part-comment-bottom') || null;
+    const topWrap = doc.querySelector('.part-comment-top') || null;
+    const botWrap = doc.querySelector('.part-comment-bottom') || null;
+
+    const noteTopNode = pickPartCommentContentNode(topWrap) || (topWrap ? stripLeadingPartNoteHeaderInPlace(topWrap.cloneNode(true)) : null);
+    const noteBotNode = pickPartCommentContentNode(botWrap) || (botWrap ? stripLeadingPartNoteHeaderInPlace(botWrap.cloneNode(true)) : null);
 
     return {
       id: partId,
