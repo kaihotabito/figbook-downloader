@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         Ficbook Downloader — EPUB & FB2
 // @namespace    https://github.com/kaihotabito/figbook-downloader/
-// @version      2.0
+// @version      2.2
 // @description  Скачивание фанфиков с Ficbook в EPUB и FB2
 // @author       kaihotabito
 // @match        https://ficbook.net/readfic/*
 // @grant        unsafeWindow
 // @run-at       document-idle
+// @license MIT
 // ==/UserScript==
 
 (function () {
@@ -40,6 +41,10 @@
     .tag-container { margin-top: 6px; line-height: 2em; }
     span.tag { display: inline-block; background: #f0e6d2; color: #4a3c31; padding: 2px 8px; margin-right: 6px; margin-bottom: 6px; border-radius: 4px; font-size: 0.85em; border: 1px solid #dcc; }
     span.tag.adult { background: #e6d2d2; color: #500; }
+
+    .toc-page h2 { text-align: center; margin: 1.2em 0 0.8em; font-weight: bold; font-size: 1.4em; }
+    .toc-page ol { margin: 0; padding-left: 1.2em; }
+    .toc-page li { margin: 0.4em 0; }
 
     blockquote { margin: 1em 0 1em 1.5em; padding-left: 1em; border-left: 2px solid #bbb; }
     pre { white-space: pre-wrap; font-family: monospace; font-size: 0.95em; background: #f6f6f6; padding: 10px; border-radius: 6px; }
@@ -331,6 +336,18 @@
     }
   }
 
+  // Некоторые фанфики состоят из одной части: URL вида /readfic/<ficId> (без /<partId>).
+  // В таком случае идентификатор части можно вытащить из скрытых полей страницы.
+  function getPartIdFromDoc(doc = document) {
+    const v =
+      doc.querySelector('input[name="part_id"]')?.getAttribute('value') ||
+      doc.querySelector('input[name="part_id"]')?.value ||
+      doc.querySelector('[data-part-id]')?.getAttribute?.('data-part-id') ||
+      null;
+    const s = (v ?? '').toString().trim();
+    return /^\d+$/.test(s) ? s : null;
+  }
+
   function getBaseFicUrl(u = location.href) {
     const ficId = getFicIdFromUrl(u);
     return ficId ? `${location.origin}/readfic/${ficId}` : location.href.split('#')[0];
@@ -523,7 +540,7 @@
 
   function parseTocParts(doc = document) {
     const anchors = Array.from(doc.querySelectorAll('.list-of-fanfic-parts a.part-link'));
-    return anchors
+    const parts = anchors
       .filter(a => !a.classList.contains('line-link'))
       .map(a => {
         const href = a.getAttribute('href') || '';
@@ -544,6 +561,23 @@
         return partId ? { partId, title, url: abs.split('#')[0] } : null;
       })
       .filter(Boolean);
+
+    if (parts.length) return parts;
+
+    // Фоллбек: фанфик из одной части (на странице сразу отображается текст, оглавления нет).
+    // Пример: /readfic/<ficId>
+    const hasText =
+      !!(doc.querySelector('.part_text') || doc.querySelector('[itemprop="articleBody"]'));
+    if (!hasText) return [];
+
+    const partId = getPartIdFromUrl(location.href) || getPartIdFromDoc(doc) || '1';
+    const title =
+      (doc.querySelector('.title-area h2')?.textContent || '').trim() ||
+      (doc.querySelector('h2')?.textContent || '').trim() ||
+      `Глава ${partId}`;
+
+    const url = location.href.split('#')[0];
+    return [{ partId, title, url }];
   }
 
   function parseMeta(doc = document) {
@@ -1078,6 +1112,35 @@
     navPoints.push(`<navPoint id="navPoint-title" playOrder="${playOrder++}"><navLabel><text>Информация</text></navLabel><content src="title.xhtml"/></navPoint>`);
 
     const chaptersArr = (data.chapters || []);
+
+    // Внутренняя страница "Содержание" (кликабельный список глав внутри книги).
+    // Многие ридеры показывают NCX-оглавление, но часть приложений ожидает отдельную страницу.
+    const tocLinks = chaptersArr.map((chap, idx) => {
+      const href = `chapter_${idx + 1}.xhtml#start`;
+      return `<li><a href="${href}">${escapeXml(chap?.title || `Глава ${idx + 1}`)}</a></li>`;
+    }).join('\n    ');
+
+    const tocXhtml = `<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN"
+  "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <title>Содержание</title>
+  <link rel="stylesheet" href="style.css" type="text/css"/>
+</head>
+<body class="toc-page">
+  <h2>Содержание</h2>
+  <ol>
+    ${tocLinks}
+  </ol>
+</body>
+</html>`;
+
+    zipEntries.push({ name: 'OEBPS/toc.xhtml', data: tocXhtml });
+    items.push(`<item id="tocpage" href="toc.xhtml" media-type="application/xhtml+xml"/>`);
+    spine.push(`<itemref idref="tocpage"/>`);
+    navPoints.push(`<navPoint id="navPoint-tocpage" playOrder="${playOrder++}"><navLabel><text>Содержание</text></navLabel><content src="toc.xhtml"/></navPoint>`);
+
     for (let idx = 0; idx < chaptersArr.length; idx++) {
       const chap = chaptersArr[idx];
       const id = `chap${idx + 1}`;
@@ -1108,6 +1171,7 @@
   <link rel="stylesheet" href="style.css" type="text/css"/>
 </head>
 <body>
+  <a id="start"></a>
   <h2 class="chapter-title">${escapeXml(chap.title)}</h2>
   ${topHtml}
   <div class="chapter-text">${contentHtml}</div>
@@ -1142,6 +1206,9 @@
   <spine toc="ncx">
     ${spine.join('\n    ')}
   </spine>
+  <guide>
+    <reference type="toc" title="Содержание" href="toc.xhtml"/>
+  </guide>
 </package>`;
     zipEntries.push({ name: 'OEBPS/content.opf', data: opf });
 
@@ -1321,8 +1388,10 @@ ${body.trim()}
     if (isPremiumUser()) return false;
 
     const ficId = getFicIdFromUrl();
-    const partId = getPartIdFromUrl();
+    // Для одночастных фанфиков partId может отсутствовать в URL.
+    const partId = getPartIdFromUrl() || getPartIdFromDoc(document);
     if (!ficId || !partId) return false;
+    if (isTocPage(document)) return false;
 
     const data = extractChapterDataFromDoc(document, partId, location.href.split('#')[0]);
     if (!data) return false;
